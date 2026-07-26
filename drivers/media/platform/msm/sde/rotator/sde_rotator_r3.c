@@ -419,6 +419,7 @@ static const u32 sde_hw_rotator_v4_outpixfmts[] = {
 };
 
 static const u32 sde_hw_rotator_v4_inpixfmts_sbuf[] = {
+	SDE_PIX_FMT_RGBA_8888,
 	SDE_PIX_FMT_Y_CBCR_H2V2_P010,
 	SDE_PIX_FMT_Y_CBCR_H2V2,
 	SDE_PIX_FMT_Y_CRCB_H2V2,
@@ -431,6 +432,7 @@ static const u32 sde_hw_rotator_v4_inpixfmts_sbuf[] = {
 };
 
 static const u32 sde_hw_rotator_v4_outpixfmts_sbuf[] = {
+	SDE_PIX_FMT_RGBA_8888_TILE,
 	SDE_PIX_FMT_Y_CBCR_H2V2_TP10,
 	SDE_PIX_FMT_Y_CBCR_H2V2_P010_TILE,
 	SDE_PIX_FMT_Y_CBCR_H2V2_TILE,
