@@ -552,6 +552,11 @@ static int m_can_do_rx_poll(struct net_device *dev, int quota)
 		/* acking an element acks all the ones before it too */
 		m_can_write(cdev, M_CAN_RXF0A, fgi);
 
+		/* on peripherals, RF0N was acked before reading RXF0S, so any
+		 * newer frames raise another interrupt
+		 */
+		if (cdev->is_peripheral)
+			break;
 		rxfs = m_can_read(cdev, M_CAN_RXF0S);
 	}
 
@@ -841,9 +846,11 @@ static int m_can_rx_handler(struct net_device *dev, int quota)
 {
 	struct m_can_classdev *cdev = netdev_priv(dev);
 	int work_done = 0;
-	u32 irqstatus, psr;
+	u32 irqstatus, psr = 0;
 
-	irqstatus = cdev->irqstatus | m_can_read(cdev, M_CAN_IR);
+	irqstatus = cdev->irqstatus;
+	if (!cdev->is_peripheral)
+		irqstatus |= m_can_read(cdev, M_CAN_IR);
 	if (!irqstatus)
 		goto end;
 
@@ -868,7 +875,8 @@ static int m_can_rx_handler(struct net_device *dev, int quota)
 		}
 	}
 
-	psr = m_can_read(cdev, M_CAN_PSR);
+	if (irqstatus & (IR_ERR_STATE | IR_ERR_BUS_30X))
+		psr = m_can_read(cdev, M_CAN_PSR);
 
 	if (irqstatus & IR_ERR_STATE)
 		work_done += m_can_handle_state_errors(dev, psr);
@@ -888,8 +896,6 @@ static int m_can_rx_peripheral(struct net_device *dev)
 
 	/* the RF0N interrupt was already acked, so drain everything now */
 	m_can_rx_handler(dev, INT_MAX);
-
-	m_can_enable_all_interrupts(cdev);
 
 	return 0;
 }
@@ -953,14 +959,26 @@ static irqreturn_t m_can_isr(int irq, void *dev_id)
 	u32 ir;
 
 	ir = m_can_read(cdev, M_CAN_IR);
-	if (!ir)
+	if (!ir) {
+		/* the interrupt line is level triggered on peripherals, so
+		 * clear the peripheral's own interrupt flags or it never
+		 * deasserts
+		 */
+		if (cdev->is_peripheral && cdev->ops->clear_interrupts) {
+			cdev->ops->clear_interrupts(cdev);
+			return IRQ_HANDLED;
+		}
 		return IRQ_NONE;
+	}
 
 	/* ACK all irqs */
 	if (ir & IR_ALL_INT)
 		m_can_write(cdev, M_CAN_IR, ir);
 
-	if (cdev->ops->clear_interrupts)
+	/* on peripherals every access costs a bus transaction, their own
+	 * flags are cleared above when they're the only interrupt source
+	 */
+	if (cdev->ops->clear_interrupts && !cdev->is_peripheral)
 		cdev->ops->clear_interrupts(cdev);
 
 	/* schedule NAPI in case of
@@ -970,11 +988,15 @@ static irqreturn_t m_can_isr(int irq, void *dev_id)
 	 */
 	if ((ir & IR_RF0N) || (ir & IR_ERR_ALL_30X)) {
 		cdev->irqstatus = ir;
-		m_can_disable_all_interrupts(cdev);
-		if (!cdev->is_peripheral)
+		if (!cdev->is_peripheral) {
+			m_can_disable_all_interrupts(cdev);
 			napi_schedule(&cdev->napi);
-		else
+		} else {
+			/* the threaded irq is oneshot, so the line is already
+			 * masked until this returns
+			 */
 			m_can_rx_peripheral(dev);
+		}
 	}
 
 	if (cdev->version == 30) {
