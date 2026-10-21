@@ -512,10 +512,26 @@ static int m_can_do_rx_poll(struct net_device *dev, int quota)
 		n = min3(rxfs & RXFS_FFL_MASK, num - fgi,
 			 (u32)ARRAY_SIZE(buf) / words);
 		n = min_t(u32, n, quota);
-		cdev->ops->read_fifo(cdev, cdev->mcfg[MRAM_RXF0].off +
-				     fgi * cdev->elem_size, buf, n * words);
-		for (i = 0; i < n; i++)
+		if (cdev->ops->read_fifo(cdev, cdev->mcfg[MRAM_RXF0].off +
+					 fgi * cdev->elem_size, buf, n * words))
+			break;
+
+		/* no filters are set up, so every frame in the FIFO is a non
+		 * matching one. a peripheral that stopped answering reads 0
+		 * instead, leave the rest for its recovery
+		 */
+		for (i = 0; i < n && (buf[i * words + 1] & RX_BUF_ANMF); i++)
 			m_can_read_fifo(dev, &buf[i * words]);
+		if (i < n) {
+			if (net_ratelimit())
+				netdev_warn(dev, "bad RX element %08x %08x\n",
+					    buf[i * words], buf[i * words + 1]);
+			dev->stats.rx_errors++;
+			if (i)
+				m_can_write(cdev, M_CAN_RXF0A, fgi + i - 1);
+			pkts += i;
+			break;
+		}
 
 		/* acking an element acks the ones before it too */
 		m_can_write(cdev, M_CAN_RXF0A, fgi + n - 1);
