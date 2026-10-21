@@ -286,6 +286,25 @@ static int tcan4x5x_write_fifo(struct m_can_classdev *cdev,
 	return regmap_write(priv->regmap, priv->mram_start + addr_offset, val);
 }
 
+static int tcan4x5x_read_fifo_bulk(struct m_can_classdev *cdev,
+				   int addr_offset, void *val, size_t val_count)
+{
+	struct tcan4x5x_priv *priv = cdev->device_data;
+
+	return regmap_bulk_read(priv->regmap, priv->mram_start + addr_offset,
+				val, val_count);
+}
+
+static int tcan4x5x_write_fifo_bulk(struct m_can_classdev *cdev,
+				    int addr_offset, const void *val,
+				    size_t val_count)
+{
+	struct tcan4x5x_priv *priv = cdev->device_data;
+
+	return regmap_bulk_write(priv->regmap, priv->mram_start + addr_offset,
+				 val, val_count);
+}
+
 static int tcan4x5x_power_enable(struct regulator *reg, int enable)
 {
 	if (IS_ERR_OR_NULL(reg))
@@ -401,6 +420,8 @@ static struct m_can_ops tcan4x5x_ops = {
 	.write_reg = tcan4x5x_write_reg,
 	.write_fifo = tcan4x5x_write_fifo,
 	.read_fifo = tcan4x5x_read_fifo,
+	.write_fifo_bulk = tcan4x5x_write_fifo_bulk,
+	.read_fifo_bulk = tcan4x5x_read_fifo_bulk,
 	.clear_interrupts = tcan4x5x_clear_interrupts,
 };
 

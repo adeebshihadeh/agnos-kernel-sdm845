@@ -66,6 +66,11 @@ struct m_can_ops {
 	u32 (*read_fifo)(struct m_can_classdev *cdev, int addr_offset);
 	int (*write_fifo)(struct m_can_classdev *cdev, int addr_offset,
 			  int val);
+	/* optional, transfer val_count words in a single bus access */
+	int (*read_fifo_bulk)(struct m_can_classdev *cdev, int addr_offset,
+			      void *val, size_t val_count);
+	int (*write_fifo_bulk)(struct m_can_classdev *cdev, int addr_offset,
+			       const void *val, size_t val_count);
 	int (*init)(struct m_can_classdev *cdev);
 };
 
@@ -80,6 +85,8 @@ struct m_can_classdev {
 	struct workqueue_struct *tx_wq;
 	struct work_struct tx_work;
 	struct sk_buff *tx_skb;
+	/* peripherals: frames waiting for a free TX FIFO element */
+	struct sk_buff_head tx_skbs;
 
 	struct can_bittiming_const *bit_timing;
 	struct can_bittiming_const *data_timing;
