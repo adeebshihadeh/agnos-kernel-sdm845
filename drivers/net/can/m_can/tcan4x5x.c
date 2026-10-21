@@ -97,6 +97,11 @@
 #define TCAN4X5X_WRITE_CMD (0x61 << 24)
 #define TCAN4X5X_READ_CMD (0x41 << 24)
 
+/* the reset value with MODE_SEL normal: WAKE_CONFIG both edges, CLK_REF
+ * 40 MHz and bit 5, which must be written 1
+ */
+#define TCAN4X5X_CONFIG_NORMAL 0xc80004a0
+
 #define TCAN4X5X_MODE_SEL_MASK (BIT(7) | BIT(6))
 #define TCAN4X5X_MODE_SLEEP 0x00
 #define TCAN4X5X_MODE_STANDBY BIT(6)
@@ -345,6 +350,7 @@ static int tcan4x5x_clear_interrupts(struct m_can_classdev *cdev)
 static int tcan4x5x_init(struct m_can_classdev *cdev)
 {
 	struct tcan4x5x_priv *tcan4x5x = cdev->device_data;
+	u32 val;
 	int ret;
 
 	tcan4x5x_check_wake(tcan4x5x);
@@ -363,15 +369,24 @@ static int tcan4x5x_init(struct m_can_classdev *cdev)
 	if (ret)
 		return ret;
 
-	ret = regmap_update_bits(tcan4x5x->regmap, TCAN4X5X_CONFIG,
-				 TCAN4X5X_MODE_SEL_MASK, TCAN4X5X_MODE_NORMAL);
+	/* write the whole word, a read-modify-write after a failed read
+	 * writes a garbage mode
+	 */
+	ret = tcan4x5x_write_tcan_reg(cdev, TCAN4X5X_CONFIG,
+				      TCAN4X5X_CONFIG_NORMAL);
 	if (ret)
 		return ret;
 
-	/* Zero out the MCAN buffers */
-	m_can_init_ram(cdev);
+	ret = regmap_read(tcan4x5x->regmap, TCAN4X5X_CONFIG, &val);
+	if (ret)
+		return ret;
+	if (val != TCAN4X5X_CONFIG_NORMAL) {
+		dev_err(cdev->dev, "config is 0x%08x after writing 0x%08x\n",
+			val, TCAN4X5X_CONFIG_NORMAL);
+		return -EIO;
+	}
 
-	return ret;
+	return 0;
 }
 
 static int tcan4x5x_parse_config(struct m_can_classdev *cdev)
