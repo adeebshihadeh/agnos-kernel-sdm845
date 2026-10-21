@@ -79,6 +79,20 @@ enum m_can_reg {
 /* napi related */
 #define M_CAN_NAPI_WEIGHT	64
 
+/* peripherals: how often the watchdog checks the controller, how many checks
+ * frames may wait without any being sent, and how many interrupts in a row
+ * may have nothing to handle
+ */
+#define M_CAN_WATCHDOG_MS	20
+#define M_CAN_TX_STALL_CHECKS	5
+#define M_CAN_TX_IDLE_CHECKS	10
+#define M_CAN_IRQ_IDLE_MAX	64
+/* and how many message RAM failures there may be in that many checks */
+#define M_CAN_FAULTS_MAX	4
+#define M_CAN_FAULT_CHECKS	5
+
+static void m_can_watchdog(struct work_struct *ws);
+
 /* Core Release Register (CREL) */
 #define CREL_REL_SHIFT		28
 #define CREL_REL_MASK		(0xF << CREL_REL_SHIFT)
@@ -154,6 +168,8 @@ enum m_can_reg {
 
 /* Protocol Status Register(PSR) */
 #define PSR_BO		BIT(7)
+#define PSR_ACT_MASK	(0x3 << 3)
+#define PSR_ACT_IDLE	(0x1 << 3)
 #define PSR_EW		BIT(6)
 #define PSR_EP		BIT(5)
 #define PSR_LEC_MASK	0x7
@@ -934,9 +950,32 @@ static irqreturn_t m_can_isr(int irq, void *dev_id)
 		 */
 		if (cdev->is_peripheral && cdev->ops->clear_interrupts) {
 			cdev->ops->clear_interrupts(cdev);
+
+			/* if it still doesn't, the device stopped answering,
+			 * keep it from hogging the bus until the watchdog
+			 * checks on it
+			 */
+			if (cdev->ops->recover &&
+			    ++cdev->irq_idle >= M_CAN_IRQ_IDLE_MAX) {
+				disable_irq_nosync(irq);
+				cdev->irq_off = true;
+				mod_delayed_work(system_highpri_wq, &cdev->watchdog, 0);
+			}
 			return IRQ_HANDLED;
 		}
 		return IRQ_NONE;
+	}
+	cdev->irq_idle = 0;
+
+	/* the message RAM failed, the watchdog checks how often. an
+	 * uncorrectable error in it put the controller into INIT, let the
+	 * watchdog check on it right away
+	 */
+	if (cdev->ops->recover) {
+		if (ir & IR_MRAF)
+			cdev->faults++;
+		if (ir & (IR_BEU | IR_WDI))
+			mod_delayed_work(system_highpri_wq, &cdev->watchdog, 0);
 	}
 
 	/* ACK all irqs */
@@ -1387,6 +1426,8 @@ static int m_can_dev_setup(struct m_can_classdev *m_can_dev)
 
 	/* Shared properties of all M_CAN versions */
 	m_can_dev->version = m_can_version;
+	m_can_dev->crel = m_can_read(m_can_dev, M_CAN_CREL);
+	INIT_DELAYED_WORK(&m_can_dev->watchdog, m_can_watchdog);
 	m_can_dev->can.do_set_mode = m_can_set_mode;
 	m_can_dev->can.do_get_berr_counter = m_can_get_berr_counter;
 
@@ -1457,6 +1498,15 @@ static void m_can_stop(struct net_device *dev)
 static int m_can_close(struct net_device *dev)
 {
 	struct m_can_classdev *cdev = netdev_priv(dev);
+
+	/* first, the watchdog can restart the controller */
+	if (cdev->ops->recover) {
+		cancel_delayed_work_sync(&cdev->watchdog);
+		if (cdev->irq_off) {
+			cdev->irq_off = false;
+			enable_irq(dev->irq);
+		}
+	}
 
 	netif_stop_queue(dev);
 
@@ -1744,6 +1794,153 @@ static netdev_tx_t m_can_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
+/* peripherals: stop everything that accesses an open interface's controller,
+ * before it's reset or reconfigured. sleeps
+ */
+void m_can_class_stop_io(struct m_can_classdev *cdev)
+{
+	struct net_device *dev = cdev->net;
+
+	netif_tx_disable(dev);
+	cancel_delayed_work_sync(&cdev->can.restart_work);
+	disable_irq(dev->irq);
+	cancel_work_sync(&cdev->tx_work);
+}
+EXPORT_SYMBOL_GPL(m_can_class_stop_io);
+
+/* peripherals: configure the freshly reset controller of an interface stopped
+ * with m_can_class_stop_io(), m_can_class_resume_io() starts using it. the
+ * frames that were in the controller are lost, the queued ones are sent
+ */
+void m_can_class_restart_io(struct m_can_classdev *cdev)
+{
+	struct net_device *dev = cdev->net;
+	unsigned int i;
+
+	for (i = 0; i < cdev->can.echo_skb_max; i++)
+		can_free_echo_skb(dev, i);
+
+	m_can_start(dev);
+	cdev->wd_tx_packets = dev->stats.tx_packets;
+	cdev->wd_stalls = 0;
+	cdev->irq_idle = 0;
+	cdev->faults = 0;
+}
+EXPORT_SYMBOL_GPL(m_can_class_restart_io);
+
+void m_can_class_resume_io(struct m_can_classdev *cdev)
+{
+	struct net_device *dev = cdev->net;
+
+	if (cdev->irq_off) {
+		cdev->irq_off = false;
+		enable_irq(dev->irq);
+	}
+	enable_irq(dev->irq);
+
+	/* a bus-off turned the carrier off, its restart was cancelled */
+	netif_carrier_on(dev);
+	netif_wake_queue(dev);
+	queue_work(cdev->tx_wq, &cdev->tx_work);
+	mod_delayed_work(system_highpri_wq, &cdev->watchdog,
+			 msecs_to_jiffies(M_CAN_WATCHDOG_MS));
+}
+EXPORT_SYMBOL_GPL(m_can_class_resume_io);
+
+/* the reason a peripheral's controller needs recovering, or NULL */
+static const char *m_can_check(struct m_can_classdev *cdev)
+{
+	struct net_device *dev = cdev->net;
+	unsigned long tx_packets = dev->stats.tx_packets;
+	u32 crel, cccr, txfqs, tfgi;
+
+	/* a TCAN4x5x whose internal bus hangs answers its own SPI registers,
+	 * but reads 0 for everything else
+	 */
+	crel = m_can_read(cdev, M_CAN_CREL);
+	if (crel != cdev->crel)
+		return "it stopped answering";
+
+	if (cdev->irq_off)
+		return "an interrupt storm";
+
+	/* one message RAM failure loses a frame, it keeps failing when the
+	 * RAM's broken
+	 */
+	if (cdev->faults >= M_CAN_FAULTS_MAX)
+		return "message RAM failures";
+	if (++cdev->wd_checks % M_CAN_FAULT_CHECKS == 0)
+		cdev->faults = 0;
+
+	/* it sent frames since the last check, so it's in operation and
+	 * isn't stalled. skip the reads below then, they take the SPI bus
+	 * from the RX FIFO reads when it's busiest
+	 */
+	if (tx_packets != cdev->wd_tx_packets) {
+		cdev->wd_tx_packets = tx_packets;
+		cdev->wd_stalls = 0;
+		return NULL;
+	}
+
+	/* bus-off puts the controller into INIT, the restart takes it out */
+	if (cdev->can.state != CAN_STATE_BUS_OFF) {
+		cccr = m_can_read(cdev, M_CAN_CCCR);
+		if ((cccr & CCCR_INIT) &&
+		    !(m_can_read(cdev, M_CAN_PSR) & PSR_BO))
+			return "it left operation";
+	}
+
+	/* frames waiting while none are sent: the controller doesn't send
+	 * them, or they never got to it. unless nobody ACKs them, then it
+	 * keeps sending them, with only a short break in between. on a busy
+	 * SPI bus the TX events come late, the FIFO's get index moving means
+	 * it's sending too
+	 */
+	txfqs = m_can_read(cdev, M_CAN_TXFQS);
+	tfgi = (txfqs & TXFQS_TFGI_MASK) >> TXFQS_TFGI_SHIFT;
+	if (tx_packets == cdev->wd_tx_packets && tfgi == cdev->wd_tfgi &&
+	    cdev->can.state != CAN_STATE_BUS_OFF &&
+	    !(cdev->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) &&
+	    (skb_queue_len(&cdev->tx_skbs) ||
+	     ((txfqs & TXFQS_TFFL_MASK) >> TXFQS_TFFL_SHIFT) <
+	     cdev->mcfg[MRAM_TXB].num)) {
+		if ((m_can_read(cdev, M_CAN_ECR) & ECR_TEC_MASK) < 96) {
+			if (++cdev->wd_stalls >= M_CAN_TX_STALL_CHECKS)
+				return "TX stalled";
+		} else if ((m_can_read(cdev, M_CAN_PSR) & PSR_ACT_MASK) ==
+			   PSR_ACT_IDLE) {
+			if (++cdev->wd_stalls >= M_CAN_TX_IDLE_CHECKS)
+				return "TX stalled while error passive";
+		} else {
+			cdev->wd_stalls = 0;
+		}
+	} else {
+		cdev->wd_stalls = 0;
+	}
+	cdev->wd_tx_packets = tx_packets;
+	cdev->wd_tfgi = tfgi;
+
+	return NULL;
+}
+
+/* peripherals sit behind a bus and can stop working on their own: a TCAN4x5x
+ * whose internal bus hangs, or whose message RAM fails, stops sending without
+ * an error. check on the controller regularly and get it going again
+ */
+static void m_can_watchdog(struct work_struct *ws)
+{
+	struct m_can_classdev *cdev = container_of(to_delayed_work(ws),
+						   struct m_can_classdev,
+						   watchdog);
+	const char *why = m_can_check(cdev);
+
+	if (why)
+		cdev->ops->recover(cdev, why);
+
+	queue_delayed_work(system_highpri_wq, &cdev->watchdog,
+			      msecs_to_jiffies(M_CAN_WATCHDOG_MS));
+}
+
 static int m_can_open(struct net_device *dev)
 {
 	struct m_can_classdev *cdev = netdev_priv(dev);
@@ -1765,7 +1962,7 @@ static int m_can_open(struct net_device *dev)
 		cdev->tx_skb = NULL;
 		skb_queue_head_init(&cdev->tx_skbs);
 		cdev->tx_wq = alloc_workqueue("mcan_wq",
-					      WQ_FREEZABLE | WQ_MEM_RECLAIM, 0);
+					      WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
 		if (!cdev->tx_wq) {
 			err = -ENOMEM;
 			goto out_wq_fail;
@@ -1795,6 +1992,15 @@ static int m_can_open(struct net_device *dev)
 		napi_enable(&cdev->napi);
 
 	netif_start_queue(dev);
+
+	if (cdev->ops->recover) {
+		cdev->wd_tx_packets = dev->stats.tx_packets;
+		cdev->wd_stalls = 0;
+		cdev->irq_idle = 0;
+		cdev->faults = 0;
+		queue_delayed_work(system_highpri_wq, &cdev->watchdog,
+				      msecs_to_jiffies(M_CAN_WATCHDOG_MS));
+	}
 
 	return 0;
 

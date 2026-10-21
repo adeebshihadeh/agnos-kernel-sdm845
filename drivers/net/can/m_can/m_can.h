@@ -71,6 +71,10 @@ struct m_can_ops {
 	int (*write_fifo)(struct m_can_classdev *cdev, int addr_offset,
 			  const void *val, size_t val_count);
 	int (*init)(struct m_can_classdev *cdev);
+	/* optional, peripherals: get a controller that stopped working going
+	 * again, with m_can_class_{stop,restart,resume}_io()
+	 */
+	void (*recover)(struct m_can_classdev *cdev, const char *why);
 };
 
 struct m_can_classdev {
@@ -107,6 +111,17 @@ struct m_can_classdev {
 	/* the DT's message RAM config, laid out with RX/TX elements this big */
 	u32 mram_cfg_vals[MRAM_CFG_LEN];
 	u32 elem_size;
+
+	/* peripherals with ops->recover: checks the controller still works */
+	struct delayed_work watchdog;
+	u32 crel;
+	unsigned long wd_tx_packets;
+	u32 wd_tfgi;
+	unsigned int wd_stalls;
+	unsigned int wd_checks;
+	unsigned int irq_idle;
+	unsigned int faults;
+	bool irq_off;
 };
 
 struct m_can_classdev *m_can_class_allocate_dev(struct device *dev);
@@ -115,6 +130,9 @@ void m_can_class_unregister(struct m_can_classdev *cdev);
 int m_can_class_get_clocks(struct m_can_classdev *cdev);
 void m_can_init_ram(struct m_can_classdev *priv);
 void m_can_config_endisable(struct m_can_classdev *priv, bool enable);
+void m_can_class_stop_io(struct m_can_classdev *cdev);
+void m_can_class_restart_io(struct m_can_classdev *cdev);
+void m_can_class_resume_io(struct m_can_classdev *cdev);
 
 int m_can_class_suspend(struct device *dev);
 int m_can_class_resume(struct device *dev);

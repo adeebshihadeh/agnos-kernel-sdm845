@@ -3,6 +3,7 @@
 // Copyright (C) 2018-19 Texas Instruments Incorporated - http://www.ti.com/
 
 #include <linux/regmap.h>
+#include <linux/rtnetlink.h>
 #include <linux/spi/spi.h>
 
 #include <linux/regulator/consumer.h>
@@ -136,7 +137,24 @@ struct tcan4x5x_priv {
 	 */
 	u32 *spi_tx_buf;
 	u32 *spi_rx_buf;
+
+	/* when the watchdog last reset just this one */
+	unsigned long reset_at;
 };
+
+/* all TCANs on a board share a reset line, which the first one owns */
+#define TCAN4X5X_MAX_DEVS 4
+static DEFINE_MUTEX(tcan4x5x_devs_lock);
+static struct tcan4x5x_priv *tcan4x5x_devs[TCAN4X5X_MAX_DEVS];
+
+/* resetting them all keeps rtnl and the SPI bus and costs every bus its
+ * frames in flight, so not too often: at least this long between resets,
+ * twice that each time one didn't help or they're needed again before it's
+ * been quiet for the longest
+ */
+#define TCAN4X5X_RESET_BACKOFF_MIN (HZ / 10)
+#define TCAN4X5X_RESET_BACKOFF_MAX (10 * HZ)
+static unsigned long tcan4x5x_reset_at, tcan4x5x_reset_backoff;
 
 /* the header and up to 64 words, the most m_can accesses at once */
 #define TCAN4X5X_SPI_BUF_WORDS (1 + 64)
@@ -389,6 +407,118 @@ static int tcan4x5x_init(struct m_can_classdev *cdev)
 	return 0;
 }
 
+/* the M_CAN answers and the TCAN is in normal mode */
+static bool tcan4x5x_works(struct tcan4x5x_priv *priv)
+{
+	u32 crel, config;
+
+	return !regmap_read(priv->regmap, TCAN4X5X_MCAN_OFFSET, &crel) &&
+	       crel == priv->mcan_dev->crel &&
+	       !regmap_read(priv->regmap, TCAN4X5X_CONFIG, &config) &&
+	       config == TCAN4X5X_CONFIG_NORMAL;
+}
+
+/* the watchdog found cdev stopped working. reset it, and if that can't help
+ * or it keeps happening, all of them. the open ones are configured again
+ */
+static void tcan4x5x_recover(struct m_can_classdev *cdev, const char *why)
+{
+	struct tcan4x5x_priv *priv = cdev->device_data, *rst = NULL, *p;
+	bool running[TCAN4X5X_MAX_DEVS];
+	ktime_t start = ktime_get();
+	bool works;
+	u32 crel = 0;
+	int i;
+
+	/* keeps the interfaces from being opened or closed meanwhile. closing
+	 * one waits for its watchdog, which calls this, so only try. if
+	 * another one's recovering, it's reset with it
+	 */
+	if (!rtnl_trylock())
+		return;
+	if (!mutex_trylock(&tcan4x5x_devs_lock))
+		goto out_rtnl;
+
+	/* one whose internal bus hangs only answers its SPI registers, and
+	 * only the reset line gets it back. otherwise its own reset does
+	 */
+	regmap_read(priv->regmap, TCAN4X5X_MCAN_OFFSET, &crel);
+	if (crel == cdev->crel && time_after(jiffies, priv->reset_at + HZ)) {
+		priv->reset_at = jiffies;
+		m_can_class_stop_io(cdev);
+		regmap_write(priv->regmap, TCAN4X5X_CONFIG, TCAN4X5X_SW_RESET);
+		usleep_range(700, 1000);
+		m_can_class_restart_io(cdev);
+		m_can_class_resume_io(cdev);
+		if (tcan4x5x_works(priv)) {
+			netdev_warn(cdev->net, "%s, reset it in %lld us\n", why,
+				    ktime_us_delta(ktime_get(), start));
+			goto out;
+		}
+	}
+
+	if (time_before(jiffies, tcan4x5x_reset_at + tcan4x5x_reset_backoff))
+		goto out;
+
+	/* the frames that would be sent meanwhile are queued */
+	for (i = 0; i < TCAN4X5X_MAX_DEVS; i++) {
+		p = tcan4x5x_devs[i];
+		running[i] = p && netif_running(p->mcan_dev->net);
+		if (!running[i])
+			continue;
+		if (p != priv)
+			cancel_delayed_work_sync(&p->mcan_dev->watchdog);
+		m_can_class_stop_io(p->mcan_dev);
+	}
+
+	for (i = 0; i < TCAN4X5X_MAX_DEVS; i++)
+		if (tcan4x5x_devs[i] && tcan4x5x_devs[i]->reset_gpio)
+			rst = tcan4x5x_devs[i];
+	if (rst) {
+		tcan4x5x_reset(rst);
+	} else {
+		for (i = 0; i < TCAN4X5X_MAX_DEVS; i++)
+			if (tcan4x5x_devs[i])
+				regmap_write(tcan4x5x_devs[i]->regmap,
+					     TCAN4X5X_CONFIG,
+					     TCAN4X5X_SW_RESET);
+		usleep_range(700, 1000);
+	}
+
+	/* all of them first, they share the SPI bus */
+	works = true;
+	for (i = 0; i < TCAN4X5X_MAX_DEVS; i++) {
+		if (!running[i])
+			continue;
+		p = tcan4x5x_devs[i];
+		m_can_class_restart_io(p->mcan_dev);
+		if (!tcan4x5x_works(p)) {
+			netdev_err(p->mcan_dev->net, "still not working after a reset\n");
+			works = false;
+		}
+	}
+	for (i = 0; i < TCAN4X5X_MAX_DEVS; i++)
+		if (running[i])
+			m_can_class_resume_io(tcan4x5x_devs[i]->mcan_dev);
+
+	netdev_warn(cdev->net, "%s, reset all TCANs in %lld us\n", why,
+		    ktime_us_delta(ktime_get(), start));
+
+	if (works && time_after(jiffies, tcan4x5x_reset_at +
+				TCAN4X5X_RESET_BACKOFF_MAX))
+		tcan4x5x_reset_backoff = TCAN4X5X_RESET_BACKOFF_MIN;
+	else
+		tcan4x5x_reset_backoff = clamp(2 * tcan4x5x_reset_backoff,
+					       (unsigned long)TCAN4X5X_RESET_BACKOFF_MIN,
+					       (unsigned long)TCAN4X5X_RESET_BACKOFF_MAX);
+	tcan4x5x_reset_at = jiffies;
+
+out:
+	mutex_unlock(&tcan4x5x_devs_lock);
+out_rtnl:
+	rtnl_unlock();
+}
+
 static int tcan4x5x_parse_config(struct m_can_classdev *cdev)
 {
 	struct tcan4x5x_priv *tcan4x5x = cdev->device_data;
@@ -432,6 +562,7 @@ static struct m_can_ops tcan4x5x_ops = {
 	.write_fifo = tcan4x5x_write_fifo,
 	.read_fifo = tcan4x5x_read_fifo,
 	.clear_interrupts = tcan4x5x_clear_interrupts,
+	.recover = tcan4x5x_recover,
 };
 
 static int tcan4x5x_can_probe(struct spi_device *spi)
@@ -548,6 +679,11 @@ static int tcan4x5x_can_probe(struct spi_device *spi)
 	if (ret)
 		goto out_power_registered;
 
+	mutex_lock(&tcan4x5x_devs_lock);
+	if (spi->chip_select < TCAN4X5X_MAX_DEVS)
+		tcan4x5x_devs[spi->chip_select] = priv;
+	mutex_unlock(&tcan4x5x_devs_lock);
+
 	netdev_info(mcan_class->net, "TCAN4X5X successfully initialized.\n");
 	return 0;
 
@@ -573,6 +709,11 @@ out_power_registered:
 static int tcan4x5x_can_remove(struct spi_device *spi)
 {
 	struct tcan4x5x_priv *priv = spi_get_drvdata(spi);
+
+	mutex_lock(&tcan4x5x_devs_lock);
+	if (spi->chip_select < TCAN4X5X_MAX_DEVS)
+		tcan4x5x_devs[spi->chip_select] = NULL;
+	mutex_unlock(&tcan4x5x_devs_lock);
 
 	tcan4x5x_power_enable(priv->power, 0);
 
