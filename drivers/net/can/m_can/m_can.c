@@ -756,6 +756,10 @@ static int m_can_handle_state_errors(struct net_device *dev, u32 psr)
 
 static void m_can_handle_other_err(struct net_device *dev, u32 irqstatus)
 {
+	/* a failing chip can raise these on every interrupt */
+	if (!net_ratelimit())
+		return;
+
 	if (irqstatus & IR_WDI)
 		netdev_err(dev, "Message RAM Watchdog event due to missing READY\n");
 	if (irqstatus & IR_ELO)
