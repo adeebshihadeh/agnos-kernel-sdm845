@@ -874,7 +874,11 @@ static void m_can_echo_tx_event(struct net_device *dev)
 	struct net_device_stats *stats = &dev->stats;
 	u32 num = cdev->mcfg[MRAM_TXE].num;
 	u32 buf[M_CAN_FIFO_BATCH_WORDS];
-	u32 txefs, fgi, count, n, i;
+	u32 txefs, fgi, count, n, i, mm;
+
+	/* the TX work checks the TX event FIFO against the echo skbs */
+	if (cdev->is_peripheral)
+		mutex_lock(&cdev->tef_lock);
 
 	txefs = m_can_read(cdev, M_CAN_TXEFS);
 	fgi = (txefs & TXEFS_EFGI_MASK) >> TXEFS_EFGI_SHIFT;
@@ -892,15 +896,24 @@ static void m_can_echo_tx_event(struct net_device *dev)
 
 		/* the message marker is the echo skb index */
 		for (i = 0; i < n; i++) {
-			stats->tx_bytes += can_get_echo_skb(dev,
-				(buf[2 * i + 1] & TX_EVENT_MM_MASK) >>
-				TX_EVENT_MM_SHIFT);
+			mm = (buf[2 * i + 1] & TX_EVENT_MM_MASK) >>
+			     TX_EVENT_MM_SHIFT;
+			if (mm >= cdev->can.echo_skb_max) {
+				if (net_ratelimit())
+					netdev_warn(dev, "bad TX event %08x %08x\n",
+						    buf[2 * i], buf[2 * i + 1]);
+				continue;
+			}
+			stats->tx_bytes += can_get_echo_skb(dev, mm);
 			stats->tx_packets++;
 		}
 
 		count -= n;
 		fgi = (fgi + n) % num;
 	}
+
+	if (cdev->is_peripheral)
+		mutex_unlock(&cdev->tef_lock);
 }
 
 static irqreturn_t m_can_isr(int irq, void *dev_id)
@@ -1628,6 +1641,23 @@ static void m_can_tx_work_queue(struct work_struct *ws)
 	putidx = (txfqs & TXFQS_TFQPI_MASK) >> TXFQS_TFQPI_SHIFT;
 	start = putidx;
 
+	/* the M_CAN doesn't use the element at the put index, so if its echo
+	 * skb is still there with all TX events handled, its TX event or TX
+	 * request got lost. it would block the FIFO forever, free it
+	 */
+	if (free && cdev->can.echo_skb[putidx]) {
+		mutex_lock(&cdev->tef_lock);
+		if (cdev->can.echo_skb[putidx] &&
+		    !(m_can_read(cdev, M_CAN_TXEFS) & TXEFS_EFFL_MASK)) {
+			if (net_ratelimit())
+				netdev_warn(dev, "freeing the stale echo skb %u\n",
+					    putidx);
+			can_free_echo_skb(dev, putidx);
+			dev->stats.tx_errors++;
+		}
+		mutex_unlock(&cdev->tef_lock);
+	}
+
 	/* an element's echo skb is freed when its TX event is handled */
 	while (free && !cdev->can.echo_skb[putidx] &&
 	       (skb = skb_dequeue(&cdev->tx_skbs))) {
@@ -1908,6 +1938,7 @@ struct m_can_classdev *m_can_class_allocate_dev(struct device *dev)
 
 	class_dev->net = net_dev;
 	class_dev->dev = dev;
+	mutex_init(&class_dev->tef_lock);
 	SET_NETDEV_DEV(net_dev, dev);
 
 	memcpy(class_dev->mram_cfg_vals, mram_config_vals,

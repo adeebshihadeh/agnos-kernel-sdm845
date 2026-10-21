@@ -86,6 +86,8 @@ struct m_can_classdev {
 	struct sk_buff *tx_skb;
 	/* peripherals: frames waiting for the TX work */
 	struct sk_buff_head tx_skbs;
+	/* peripherals: TX event handling vs the TX work's stale echo check */
+	struct mutex tef_lock;
 
 	struct can_bittiming_const *bit_timing;
 	struct can_bittiming_const *data_timing;
